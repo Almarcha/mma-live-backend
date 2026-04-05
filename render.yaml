@@ -1,0 +1,18 @@
+# render.yaml — Configuración para despliegue en Render.com (gratis)
+# Sube este archivo a la raíz del repo y conecta con Render
+
+services:
+  - type: web
+    name: mma-live-api
+    env: python
+    plan: free                          # Plan gratuito
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: SUPABASE_URL
+        sync: false                     # Lo pones manualmente en Render dashboard
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
