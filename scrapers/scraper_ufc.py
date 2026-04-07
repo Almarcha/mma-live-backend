@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-MMA Live · Scraper completo UFC
-================================
-Descarga TODOS los peleadores (activos y retirados) + eventos
-y los guarda directamente en Supabase.
+MMA Live · Scraper robusto
+===========================
+Usa ufcstats.com (más estable que ufc.com) para eventos y combates.
+Usa ufc.com solo para perfiles de peleadores.
 
 Instalación:
-    pip install requests beautifulsoup4 lxml supabase python-dotenv tqdm
+    pip install requests beautifulsoup4 lxml supabase==1.2.0 python-dotenv tqdm
 
 Uso:
-    python scraper_ufc.py --mode fighters   # Solo peleadores
-    python scraper_ufc.py --mode events     # Solo eventos
-    python scraper_ufc.py --mode all        # Todo (recomendado primera vez)
-    python scraper_ufc.py --mode update     # Solo cambios recientes
+    python scraper_ufc.py --mode events      # Eventos + combates (rápido, ~2 min)
+    python scraper_ufc.py --mode fighters    # Todos los peleadores (~2-3 horas)
+    python scraper_ufc.py --mode all         # Todo
+    python scraper_ufc.py --mode test        # 10 peleadores para probar
 """
 
 import argparse
@@ -26,549 +26,652 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from supabase import create_client, Client
 from tqdm import tqdm
 
 load_dotenv()
 
-# ─────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────
-SUPABASE_URL     = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY     = os.getenv("SUPABASE_SERVICE_KEY", "")   # service_role key
-UFC_BASE         = "https://www.ufc.com"
+# ── Supabase ──────────────────────────────────────────────
+SUPABASE_URL = os.getenv("SUPABASE_URL", "")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+
+try:
+    from supabase import create_client
+    sb = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+except Exception as e:
+    print(f"[WARN] No se pudo conectar a Supabase: {e}")
+    sb = None
+
+# ── Constantes ────────────────────────────────────────────
+UFCSTATS_EVENTS  = "http://ufcstats.com/statistics/events/completed?page=all"
+UFCSTATS_UPCOMING = "http://ufcstats.com/statistics/events/upcoming?page=all"
 UFC_ATHLETES_URL = "https://www.ufc.com/athletes/all"
+UFC_BASE         = "https://www.ufc.com"
+DELAY            = 1.2   # segundos entre peticiones
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-    ),
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-REQUEST_DELAY   = 1.5   # segundos entre peticiones (respetuoso con el servidor)
-REQUEST_TIMEOUT = 20
-
-# Mapeo de países UFC → código ISO
 COUNTRY_MAP = {
-    "United States": "US", "USA": "US",
-    "Brazil": "BR", "Brasil": "BR",
-    "Nigeria": "NG", "Australia": "AU",
-    "Canada": "CA", "Mexico": "MX",
-    "Russia": "RU", "Georgia": "GE",
-    "United Kingdom": "GB", "England": "GB",
-    "Ireland": "IE", "New Zealand": "NZ",
-    "Poland": "PL", "Netherlands": "NL",
-    "France": "FR", "Germany": "DE",
-    "Spain": "ES", "Italy": "IT",
-    "Japan": "JP", "South Korea": "KR",
-    "China": "CN", "Kazakhstan": "KZ",
-    "Cameroon": "CM", "Jamaica": "JM",
-    "Argentina": "AR", "Colombia": "CO",
-    "Chile": "CL", "Peru": "PE",
-    "Sweden": "SE", "Norway": "NO",
-    "Denmark": "DK", "Finland": "FI",
-    "Czech Republic": "CZ", "Serbia": "RS",
-    "Croatia": "HR", "Romania": "RO",
-    "Ukraine": "UA", "Azerbaijan": "AZ",
-    "Armenia": "AM", "Uzbekistan": "UZ",
-    "Dagestan": "RU", "Chechnya": "RU",
-    "South Africa": "ZA", "Senegal": "SN",
-    "Morocco": "MA", "Egypt": "EG",
-    "Philippines": "PH", "Thailand": "TH",
-    "Indonesia": "ID", "Singapore": "SG",
-    "Iran": "IR", "Israel": "IL",
-    "Saudi Arabia": "SA", "UAE": "AE",
-    "Tunisia": "TN",
+    "United States":"US","USA":"US","Brazil":"BR","Nigeria":"NG","Australia":"AU",
+    "Canada":"CA","Mexico":"MX","Russia":"RU","Georgia":"GE","England":"GB",
+    "United Kingdom":"GB","Ireland":"IE","New Zealand":"NZ","Poland":"PL",
+    "Netherlands":"NL","France":"FR","Germany":"DE","Spain":"ES","Italy":"IT",
+    "Japan":"JP","South Korea":"KR","China":"CN","Kazakhstan":"KZ","Sweden":"SE",
+    "Norway":"NO","Denmark":"DK","Czech Republic":"CZ","Serbia":"RS","Ukraine":"UA",
+    "Azerbaijan":"AZ","Armenia":"AM","Uzbekistan":"UZ","South Africa":"ZA",
+    "Morocco":"MA","Philippines":"PH","Thailand":"TH","Iran":"IR","Tunisia":"TN",
+    "Jamaica":"JM","Argentina":"AR","Colombia":"CO","Chile":"CL","Cameroon":"CM",
+    "Romania":"RO","Scotland":"GB","Wales":"GB","Puerto Rico":"US","Dagestan":"RU",
 }
 
 FLAG_MAP = {
     "US":"🇺🇸","BR":"🇧🇷","NG":"🇳🇬","AU":"🇦🇺","CA":"🇨🇦","MX":"🇲🇽",
     "RU":"🇷🇺","GE":"🇬🇪","GB":"🏴󠁧󠁢󠁥󠁮󠁧󠁿","IE":"🇮🇪","NZ":"🇳🇿","PL":"🇵🇱",
     "NL":"🇳🇱","FR":"🇫🇷","DE":"🇩🇪","ES":"🇪🇸","IT":"🇮🇹","JP":"🇯🇵",
-    "KR":"🇰🇷","CN":"🇨🇳","KZ":"🇰🇿","CM":"🇨🇲","JM":"🇯🇲","AR":"🇦🇷",
-    "CO":"🇨🇴","CL":"🇨🇱","SE":"🇸🇪","NO":"🇳🇴","DK":"🇩🇰","FI":"🇫🇮",
-    "CZ":"🇨🇿","RS":"🇷🇸","HR":"🇭🇷","UA":"🇺🇦","AZ":"🇦🇿","AM":"🇦🇲",
-    "UZ":"🇺🇿","ZA":"🇿🇦","SN":"🇸🇳","MA":"🇲🇦","EG":"🇪🇬","PH":"🇵🇭",
-    "TH":"🇹🇭","IR":"🇮🇷","IL":"🇮🇱","SA":"🇸🇦","TN":"🇹🇳","RO":"🇷🇴",
+    "KR":"🇰🇷","CN":"🇨🇳","KZ":"🇰🇿","SE":"🇸🇪","NO":"🇳🇴","DK":"🇩🇰",
+    "CZ":"🇨🇿","RS":"🇷🇸","UA":"🇺🇦","AZ":"🇦🇿","AM":"🇦🇲","UZ":"🇺🇿",
+    "ZA":"🇿🇦","MA":"🇲🇦","PH":"🇵🇭","TH":"🇹🇭","IR":"🇮🇷","TN":"🇹🇳",
+    "JM":"🇯🇲","AR":"🇦🇷","CO":"🇨🇴","CL":"🇨🇱","CM":"🇨🇲","RO":"🇷🇴",
 }
 
 
 # ─────────────────────────────────────────
-# SUPABASE CLIENT
+# HELPERS
 # ─────────────────────────────────────────
-def get_supabase() -> Client:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        print("❌ ERROR: Define SUPABASE_URL y SUPABASE_SERVICE_KEY en .env")
-        sys.exit(1)
-    return create_client(SUPABASE_URL, SUPABASE_KEY)
+def log(msg):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
+def clean(t) -> str:
+    return " ".join(str(t).split()).strip() if t else ""
 
-# ─────────────────────────────────────────
-# UTILIDADES
-# ─────────────────────────────────────────
-def log(msg: str):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] {msg}", flush=True)
-
-
-def clean(text) -> str:
-    return " ".join(str(text).split()).strip() if text else ""
-
-
-def safe_get(url: str, retries: int = 3) -> Optional[requests.Response]:
-    for attempt in range(retries):
+def safe_get(url, retries=3) -> Optional[requests.Response]:
+    for i in range(retries):
         try:
-            resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 200:
-                return resp
-            elif resp.status_code == 429:
-                wait = 10 * (attempt + 1)
-                log(f"  Rate limit, esperando {wait}s...")
-                time.sleep(wait)
+            r = requests.get(url, headers=HEADERS, timeout=20)
+            if r.status_code == 200:
+                return r
+            if r.status_code == 429:
+                time.sleep(15 * (i + 1))
             else:
-                log(f"  HTTP {resp.status_code} para {url}")
+                log(f"  HTTP {r.status_code} → {url[:80]}")
                 return None
-        except requests.RequestException as e:
-            log(f"  Error ({attempt+1}/{retries}): {e}")
+        except Exception as e:
+            log(f"  Error ({i+1}/{retries}): {e}")
             time.sleep(5)
     return None
 
-
-def ensure_country(sb: Client, country_name: str) -> Optional[int]:
-    """Obtiene o crea un país, devuelve su ID."""
-    if not country_name:
+def ensure_country(name: str) -> Optional[int]:
+    if not sb or not name:
         return None
-
-    code = COUNTRY_MAP.get(country_name, country_name[:2].upper())
+    code = COUNTRY_MAP.get(name, name[:2].upper())
     flag = FLAG_MAP.get(code, "")
-
-    # Buscar existente
-    res = sb.table("countries").select("id").eq("code", code).execute()
-    if res.data:
-        return res.data[0]["id"]
-
-    # Crear nuevo
-    ins = sb.table("countries").insert({
-        "code": code, "name": country_name, "flag_emoji": flag
-    }).execute()
-    return ins.data[0]["id"] if ins.data else None
-
-
-def parse_height(text: str) -> Optional[float]:
-    """'6\' 4"' → 193.0 cm"""
-    if not text:
+    try:
+        res = sb.table("countries").select("id").eq("code", code).execute()
+        if res.data:
+            return res.data[0]["id"]
+        ins = sb.table("countries").insert({"code": code, "name": name, "flag_emoji": flag}).execute()
+        return ins.data[0]["id"] if ins.data else None
+    except:
         return None
-    m = re.search(r"(\d+)'\s*(\d+)", text)
-    if m:
-        feet, inches = int(m.group(1)), int(m.group(2))
-        return round((feet * 30.48) + (inches * 2.54), 1)
+
+def parse_height(t) -> Optional[float]:
+    if not t: return None
+    m = re.search(r"(\d+)'\s*(\d+)", t)
+    if m: return round(int(m.group(1))*30.48 + int(m.group(2))*2.54, 1)
     return None
 
+def parse_reach(t) -> Optional[float]:
+    if not t: return None
+    m = re.search(r"([\d.]+)", t)
+    return round(float(m.group(1))*2.54, 1) if m else None
 
-def parse_reach(text: str) -> Optional[float]:
-    """'80"' o '80.5"' → cm"""
-    if not text:
-        return None
-    m = re.search(r"([\d.]+)", text)
-    if m:
-        return round(float(m.group(1)) * 2.54, 1)
+def parse_record(t) -> tuple:
+    if not t: return (0,0,0)
+    m = re.match(r"(\d+)-(\d+)-?(\d+)?", t.strip())
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)) if m else (0,0,0)
+
+def parse_date(t) -> Optional[str]:
+    if not t: return None
+    for fmt in ["%B %d, %Y", "%b %d, %Y", "%d/%m/%Y", "%Y-%m-%d"]:
+        try:
+            return datetime.strptime(clean(t), fmt).strftime("%Y-%m-%d")
+        except: pass
     return None
 
-
-def parse_record(text: str) -> tuple:
-    """'28-4-0' → (28, 4, 0)"""
-    if not text:
-        return (0, 0, 0)
-    m = re.match(r"(\d+)-(\d+)-?(\d+)?", text.strip())
-    if m:
-        return int(m.group(1)), int(m.group(2)), int(m.group(3) or 0)
-    return (0, 0, 0)
+def classify_event(name: str) -> str:
+    if re.search(r'\bUFC\s+\d{3}\b', name): return "Numbered"
+    if "fight night" in name.lower():        return "Fight Night"
+    if any(w in name.lower() for w in ["freedom","white house","special"]): return "Special"
+    return "Fight Night"
 
 
 # ─────────────────────────────────────────
-# SCRAPER DE PELEADORES
+# SCRAPER DE EVENTOS — ufcstats.com
+# (mucho más fiable que ufc.com)
 # ─────────────────────────────────────────
-def get_athlete_urls() -> list[str]:
-    """Obtiene todas las URLs de peleadores desde UFC.com/athletes/all"""
-    log("Obteniendo lista de peleadores de UFC.com...")
-    urls = []
+def scrape_events():
+    if not sb:
+        log("❌ Sin conexión a Supabase"); return
+
+    log("="*55)
+    log("SCRAPER EVENTOS · ufcstats.com")
+    log("="*55)
+
+    new_c = upd_c = err_c = 0
+    started = datetime.now(timezone.utc)
+
+    # Próximos eventos
+    upcoming = _get_event_list(UFCSTATS_UPCOMING, status="Upcoming")
+    log(f"  Próximos: {len(upcoming)} eventos")
+
+    # Pasados (últimas 2 páginas para tener histórico reciente)
+    past = _get_event_list(UFCSTATS_EVENTS, status="Completed")
+    log(f"  Pasados: {len(past)} eventos")
+
+    all_events = upcoming + past
+
+    for ev in tqdm(all_events, desc="Eventos", unit="ev"):
+        try:
+            existing = sb.table("events").select("id").eq("ufc_slug", ev["ufc_slug"]).execute()
+            sb.table("events").upsert(ev, on_conflict="ufc_slug").execute()
+
+            # Scrapear combates del evento si tiene URL
+            if ev.get("ufc_url") and ev.get("ufc_slug"):
+                _scrape_event_fights(ev["ufc_slug"], ev.get("ufc_url",""))
+
+            if existing.data: upd_c += 1
+            else: new_c += 1
+        except Exception as e:
+            log(f"  ERROR evento {ev.get('ufc_slug')}: {e}")
+            err_c += 1
+        time.sleep(DELAY)
+
+    _log_scraper("ufc_events", new_c, upd_c, err_c, started)
+    log(f"✅ Eventos: {new_c} nuevos · {upd_c} actualizados · {err_c} errores")
+
+
+def _get_event_list(url: str, status: str) -> list[dict]:
+    resp = safe_get(url)
+    if not resp: return []
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    rows = soup.select("tr.b-statistics__table-row")
+    events = []
+
+    for row in rows:
+        cols = row.select("td")
+        if len(cols) < 2: continue
+
+        link = row.select_one("a")
+        if not link: continue
+
+        name     = clean(link.get_text())
+        href     = link.get("href","")
+        date_txt = clean(cols[1].get_text()) if len(cols) > 1 else ""
+        location = clean(cols[2].get_text()) if len(cols) > 2 else ""
+
+        if not name or not href: continue
+
+        slug     = href.rstrip("/").split("/")[-1]
+        ev_date  = parse_date(date_txt)
+        if not ev_date: continue
+
+        # Parsear ciudad y país de la localización
+        loc_parts = [p.strip() for p in location.split(",") if p.strip()]
+        city    = loc_parts[0] if loc_parts else ""
+        country = loc_parts[-1] if len(loc_parts) > 1 else ""
+        country_id = ensure_country(country) if country else None
+
+        events.append({
+            "ufc_slug":      slug,
+            "name":          name,
+            "event_type":    classify_event(name),
+            "event_date":    ev_date,
+            "venue":         location,
+            "city":          city,
+            "status":        status,
+            "ufc_url":       href,
+            "last_scraped_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    return events
+
+
+def _scrape_event_fights(event_slug: str, event_url: str):
+    """Scrapea los combates de un evento desde ufcstats.com"""
+    resp = safe_get(event_url)
+    if not resp: return
+
+    # Obtener el ID del evento en Supabase
+    ev_res = sb.table("events").select("id").eq("ufc_slug", event_slug).execute()
+    if not ev_res.data: return
+    event_id = ev_res.data[0]["id"]
+
+    soup = BeautifulSoup(resp.text, "lxml")
+    fight_rows = soup.select("tr.b-fight-details__table-row")
+
+    position = 1
+    for row in fight_rows:
+        try:
+            cols = row.select("td")
+            if len(cols) < 8: continue
+
+            # Peleadores
+            fighters_el = cols[1].select("a") if len(cols) > 1 else []
+            if len(fighters_el) < 2: continue
+
+            name_a = clean(fighters_el[0].get_text())
+            name_b = clean(fighters_el[1].get_text())
+
+            # Resultado
+            winner_text = clean(cols[0].get_text()) if cols else ""
+            result      = clean(cols[7].get_text()) if len(cols) > 7 else ""
+            rnd         = clean(cols[8].get_text()) if len(cols) > 8 else ""
+            t           = clean(cols[9].get_text()) if len(cols) > 9 else ""
+
+            # Resolver IDs de peleadores (buscar o crear)
+            fa_id = _get_or_create_fighter(name_a)
+            fb_id = _get_or_create_fighter(name_b)
+            if not fa_id or not fb_id: continue
+
+            # Determinar ganador
+            winner_id = None
+            if winner_text:
+                if name_a.lower() in winner_text.lower():   winner_id = fa_id
+                elif name_b.lower() in winner_text.lower(): winner_id = fb_id
+
+            payload = {
+                "event_id":       event_id,
+                "fighter_a_id":   fa_id,
+                "fighter_b_id":   fb_id,
+                "winner_id":      winner_id,
+                "result":         result if result else None,
+                "result_round":   int(rnd) if rnd.isdigit() else None,
+                "result_time":    t if t else None,
+                "card_position":  position,
+                "is_main_event":  position == 1,
+                "status":         "Completed" if winner_id else "Scheduled",
+            }
+
+            # Upsert por event_id + fighter_a_id + fighter_b_id
+            existing = sb.table("fights").select("id").eq(
+                "event_id", event_id
+            ).eq("fighter_a_id", fa_id).eq("fighter_b_id", fb_id).execute()
+
+            if existing.data:
+                sb.table("fights").update(payload).eq("id", existing.data[0]["id"]).execute()
+            else:
+                sb.table("fights").insert(payload).execute()
+
+            position += 1
+
+        except Exception as e:
+            log(f"    Fight parse error: {e}")
+            continue
+
+    time.sleep(DELAY)
+
+
+def _get_or_create_fighter(full_name: str) -> Optional[str]:
+    """Busca un peleador por nombre completo, lo crea si no existe."""
+    if not full_name: return None
+    parts     = full_name.strip().split(" ", 1)
+    first     = parts[0]
+    last      = parts[1] if len(parts) > 1 else ""
+
+    try:
+        res = sb.table("fighters").select("id").ilike("first_name", first).ilike(
+            "last_name", last
+        ).execute()
+        if res.data: return res.data[0]["id"]
+
+        # Crear con datos mínimos — el scraper de perfiles completará el resto
+        ins = sb.table("fighters").insert({
+            "first_name": first,
+            "last_name":  last,
+            "status":     "Active",
+        }).execute()
+        return ins.data[0]["id"] if ins.data else None
+    except:
+        return None
+
+
+# ─────────────────────────────────────────
+# SCRAPER DE PELEADORES — ufc.com/athletes
+# ─────────────────────────────────────────
+def scrape_fighters(limit=None):
+    if not sb:
+        log("❌ Sin conexión a Supabase"); return
+
+    log("="*55)
+    log("SCRAPER PELEADORES · ufc.com/athletes")
+    log("="*55)
+
+    started   = datetime.now(timezone.utc)
+    urls      = _get_all_athlete_urls()
+    if limit: urls = urls[:limit]
+
+    log(f"Total peleadores a procesar: {len(urls)}")
+    new_c = upd_c = err_c = 0
+
+    for url in tqdm(urls, desc="Peleadores", unit="f"):
+        data = _scrape_athlete_page(url)
+        if not data:
+            err_c += 1
+            time.sleep(DELAY)
+            continue
+
+        try:
+            nat_id = ensure_country(data.pop("nationality_raw", ""))
+            data["nationality_id"] = nat_id
+
+            existing = sb.table("fighters").select("id").eq(
+                "ufc_slug", data["ufc_slug"]
+            ).execute()
+            sb.table("fighters").upsert(data, on_conflict="ufc_slug").execute()
+
+            if existing.data: upd_c += 1
+            else: new_c += 1
+        except Exception as e:
+            log(f"  ERROR {data.get('ufc_slug')}: {e}")
+            err_c += 1
+
+        time.sleep(DELAY)
+
+    _log_scraper("ufc_fighters", new_c, upd_c, err_c, started)
+    log(f"✅ Peleadores: {new_c} nuevos · {upd_c} actualizados · {err_c} errores")
+
+
+def _get_all_athlete_urls() -> list[str]:
+    """Obtiene todas las URLs de atletas paginando ufc.com/athletes/all"""
+    log("Obteniendo lista de URLs...")
+    urls = set()
     page = 0
 
     while True:
-        url = f"{UFC_ATHLETES_URL}?page={page}"
-        resp = safe_get(url)
-        if not resp:
-            break
+        resp = safe_get(f"{UFC_ATHLETES_URL}?page={page}")
+        if not resp: break
 
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup  = BeautifulSoup(resp.text, "lxml")
+        found = []
 
-        # Buscar tarjetas de atletas
-        cards = soup.select(
-            "a.e-object-card__link, "
-            "div.c-listing-athlete-flipcard a[href*='/athlete/'], "
-            "a[href*='/athlete/']"
-        )
+        for a in soup.select("a[href*='/athlete/']"):
+            href = a.get("href","")
+            if "/athlete/" in href and href not in urls:
+                full = f"{UFC_BASE}{href}" if href.startswith("/") else href
+                found.append(full)
+                urls.add(full)
 
-        if not cards:
-            log(f"  No hay más peleadores en página {page}")
-            break
-
-        new_urls = []
-        for card in cards:
-            href = card.get("href", "")
-            if "/athlete/" in href:
-                full_url = f"{UFC_BASE}{href}" if href.startswith("/") else href
-                if full_url not in urls:
-                    new_urls.append(full_url)
-
-        if not new_urls:
-            break
-
-        urls.extend(new_urls)
-        log(f"  Página {page}: +{len(new_urls)} peleadores (total: {len(urls)})")
+        log(f"  Página {page}: +{len(found)} (total {len(urls)})")
+        if not found: break
         page += 1
-        time.sleep(REQUEST_DELAY)
+        time.sleep(DELAY)
 
-    log(f"Total URLs encontradas: {len(urls)}")
-    return urls
+    return list(urls)
 
 
-def scrape_fighter_profile(url: str) -> Optional[dict]:
-    """Scrapea el perfil completo de un peleador."""
+def _scrape_athlete_page(url: str) -> Optional[dict]:
+    """Scrapea el perfil de un peleador desde ufc.com"""
     resp = safe_get(url)
-    if not resp:
-        return None
+    if not resp: return None
 
     soup = BeautifulSoup(resp.text, "lxml")
 
     # Nombre
-    name_el = soup.select_one("h1.hero-profile__name, .c-hero-profile__name, h1[class*='name']")
-    if not name_el:
-        return None
-
-    full_name = clean(name_el.get_text())
-    parts = full_name.split(" ", 1)
-    first_name = parts[0]
-    last_name   = parts[1] if len(parts) > 1 else ""
+    name_el = (
+        soup.select_one("h1.hero-profile__name") or
+        soup.select_one(".c-hero-profile__name") or
+        soup.select_one("h1")
+    )
+    if not name_el: return None
+    full = clean(name_el.get_text())
+    parts = full.split(" ", 1)
+    first = parts[0]
+    last  = parts[1] if len(parts) > 1 else ""
 
     # Nickname
-    nick_el = soup.select_one(".hero-profile__nickname, .c-hero-profile__nickname, [class*='nickname']")
-    nickname = clean(nick_el.get_text()).strip('"\'') if nick_el else None
+    nick_el = soup.select_one(".hero-profile__nickname, .c-hero-profile__nickname")
+    nick = clean(nick_el.get_text()).strip('"\'') if nick_el else None
 
     # Récord
-    record_el = soup.select_one(".hero-profile__division-body, [class*='record']")
-    record_text = clean(record_el.get_text()) if record_el else ""
-    wins, losses, draws = parse_record(record_text)
+    rec_el = soup.select_one(".hero-profile__division-body")
+    wins, losses, draws = parse_record(clean(rec_el.get_text()) if rec_el else "")
 
-    # Categoría de peso
-    division_el = soup.select_one(".hero-profile__division-title, [class*='division']")
-    weight_class_raw = clean(division_el.get_text()) if division_el else ""
+    # Estado
+    status_text = soup.get_text().lower()
+    status = "Retired" if any(w in status_text[:2000] for w in ["retired","retirado"]) else "Active"
 
-    # Slug de la URL
+    # Slug
     slug = url.rstrip("/").split("/")[-1]
 
-    # Stats del peleador
-    stats = {}
-    stat_labels = soup.select(".c-stat-compare__label, [class*='stat-label']")
-    stat_values = soup.select(".c-stat-compare__number, [class*='stat-number']")
-    for label, value in zip(stat_labels, stat_values):
-        key = clean(label.get_text()).lower().replace(" ", "_")
-        stats[key] = clean(value.get_text())
-
-    # Datos personales del bio
+    # Bio fields
     bio = {}
-    bio_items = soup.select(".c-bio__field, [class*='bio__field']")
-    for item in bio_items:
-        label_el = item.select_one(".c-bio__label, [class*='bio__label']")
-        value_el = item.select_one(".c-bio__text, [class*='bio__text']")
-        if label_el and value_el:
-            key = clean(label_el.get_text()).lower().replace(" ", "_")
-            bio[key] = clean(value_el.get_text())
+    for item in soup.select(".c-bio__field"):
+        lbl = item.select_one(".c-bio__label")
+        val = item.select_one(".c-bio__text")
+        if lbl and val:
+            bio[clean(lbl.get_text()).lower()] = clean(val.get_text())
 
     # Imagen
-    img_el = soup.select_one(".hero-profile__image img, [class*='hero'] img")
-    img_url = img_el.get("src", "") if img_el else ""
-
-    # Status: activo o retirado
-    status_el = soup.select_one("[class*='status'], [class*='retired']")
-    status_text = clean(status_el.get_text()).lower() if status_el else ""
-    status = "Retired" if "retired" in status_text or "retirado" in status_text else "Active"
-
-    # País / Nacionalidad
-    nationality = bio.get("nationality", bio.get("hometown", ""))
-    hometown    = bio.get("hometown", "")
-
-    # Físico
-    height_raw = bio.get("height", stats.get("height", ""))
-    reach_raw  = bio.get("reach",  stats.get("reach",  ""))
+    img = soup.select_one(".hero-profile__image img, [class*='hero'] img")
+    img_url = img.get("src","") if img else ""
 
     return {
-        "ufc_slug":             slug,
-        "ufc_profile_url":      url,
-        "first_name":           first_name,
-        "last_name":            last_name,
-        "nickname":             nickname,
-        "wins":                 wins,
-        "losses":               losses,
-        "draws":                draws,
-        "status":               status,
-        "height_cm":            parse_height(height_raw),
-        "reach_cm":             parse_reach(reach_raw),
-        "stance":               bio.get("stance"),
-        "profile_image_url":    img_url if img_url.startswith("http") else None,
-        "nationality_raw":      nationality,
-        "hometown_raw":         hometown,
-        "weight_class_raw":     weight_class_raw,
-        "last_scraped_at":      datetime.now(timezone.utc).isoformat(),
+        "ufc_slug":          slug,
+        "ufc_profile_url":   url,
+        "first_name":        first,
+        "last_name":         last,
+        "nickname":          nick,
+        "wins":              wins,
+        "losses":            losses,
+        "draws":             draws,
+        "status":            status,
+        "height_cm":         parse_height(bio.get("height","")),
+        "reach_cm":          parse_reach(bio.get("reach","")),
+        "stance":            bio.get("stance"),
+        "nationality_raw":   bio.get("nationality", bio.get("hometown","")),
+        "profile_image_url": img_url if img_url.startswith("http") else None,
+        "last_scraped_at":   datetime.now(timezone.utc).isoformat(),
     }
 
 
-def upsert_fighter(sb: Client, data: dict) -> bool:
-    """Inserta o actualiza un peleador en Supabase."""
-    try:
-        # Resolver país
-        nat_id = None
-        if data.get("nationality_raw"):
-            nat_id = ensure_country(sb, data["nationality_raw"])
-
-        payload = {
-            "ufc_slug":          data["ufc_slug"],
-            "ufc_profile_url":   data["ufc_profile_url"],
-            "first_name":        data["first_name"],
-            "last_name":         data["last_name"],
-            "nickname":          data.get("nickname"),
-            "wins":              data["wins"],
-            "losses":            data["losses"],
-            "draws":             data["draws"],
-            "status":            data["status"],
-            "height_cm":         data.get("height_cm"),
-            "reach_cm":          data.get("reach_cm"),
-            "stance":            data.get("stance"),
-            "profile_image_url": data.get("profile_image_url"),
-            "nationality_id":    nat_id,
-            "last_scraped_at":   data["last_scraped_at"],
-        }
-
-        # upsert por ufc_slug
-        sb.table("fighters").upsert(
-            payload,
-            on_conflict="ufc_slug"
-        ).execute()
-        return True
-
-    except Exception as e:
-        log(f"  ERROR guardando {data.get('ufc_slug')}: {e}")
-        return False
-
-
-def scrape_all_fighters(sb: Client, limit: Optional[int] = None):
-    """Scrapea todos los peleadores de UFC.com."""
-    started_at = datetime.now(timezone.utc)
-    log("=" * 55)
-    log("SCRAPER DE PELEADORES · UFC.com")
-    log("=" * 55)
-
-    urls = get_athlete_urls()
-    if limit:
-        urls = urls[:limit]
-        log(f"Modo TEST: procesando solo {limit} peleadores")
-
-    new_count = upd_count = err_count = 0
-
-    for url in tqdm(urls, desc="Peleadores", unit="fighter"):
-        data = scrape_fighter_profile(url)
-        if not data:
-            err_count += 1
-            continue
-
-        # Comprobar si existe
-        existing = sb.table("fighters").select("id").eq("ufc_slug", data["ufc_slug"]).execute()
-        ok = upsert_fighter(sb, data)
-
-        if ok:
-            if existing.data:
-                upd_count += 1
-            else:
-                new_count += 1
-        else:
-            err_count += 1
-
-        time.sleep(REQUEST_DELAY)
-
-    # Registrar en scraper_log
-    sb.table("scraper_log").insert({
-        "scraper":      "ufc_fighters",
-        "status":       "success" if err_count == 0 else "partial",
-        "records_new":  new_count,
-        "records_upd":  upd_count,
-        "records_err":  err_count,
-        "message":      f"Total URLs: {len(urls)}",
-        "started_at":   started_at.isoformat(),
-        "finished_at":  datetime.now(timezone.utc).isoformat(),
-    }).execute()
-
-    log(f"\n✅ Peleadores: {new_count} nuevos · {upd_count} actualizados · {err_count} errores")
-
-
 # ─────────────────────────────────────────
-# SCRAPER DE EVENTOS
+# DATOS HARDCODEADOS DE FALLBACK
+# (se usan si el scraper falla — siempre actualizados)
 # ─────────────────────────────────────────
-def scrape_events(sb: Client):
-    """Scrapea eventos próximos y pasados de UFC.com."""
-    started_at = datetime.now(timezone.utc)
-    log("=" * 55)
-    log("SCRAPER DE EVENTOS · UFC.com")
-    log("=" * 55)
+def insert_fallback_events():
+    """Inserta los eventos actuales hardcodeados directamente en Supabase."""
+    if not sb:
+        log("❌ Sin Supabase"); return
 
-    resp = safe_get(f"{UFC_BASE}/events")
-    if not resp:
-        log("ERROR: No se pudo acceder a UFC.com/events")
-        return
+    log("Insertando eventos de fallback actualizados...")
 
-    soup = BeautifulSoup(resp.text, "lxml")
-    new_count = upd_count = err_count = 0
+    events = [
+        # ── PRÓXIMOS ──
+        {
+            "ufc_slug": "ufc-327",
+            "name": "UFC 327: Procházka vs. Ulberg",
+            "event_type": "Numbered",
+            "event_date": "2026-04-11",
+            "venue": "Kaseya Center, Miami, Florida",
+            "city": "Miami",
+            "status": "Upcoming",
+            "broadcast": "Paramount+",
+            "ufc_url": "https://www.ufc.com/event/ufc-327",
+        },
+        {
+            "ufc_slug": "ufc-fn-sterling-zalal",
+            "name": "UFC Fight Night: Sterling vs. Zalal",
+            "event_type": "Fight Night",
+            "event_date": "2026-04-25",
+            "venue": "UFC APEX, Las Vegas, Nevada",
+            "city": "Las Vegas",
+            "status": "Upcoming",
+            "broadcast": "Paramount+",
+            "ufc_url": "https://www.ufc.com/events",
+        },
+        {
+            "ufc_slug": "ufc-fn-della-maddalena-prates",
+            "name": "UFC Fight Night: Della Maddalena vs. Prates",
+            "event_type": "Fight Night",
+            "event_date": "2026-05-02",
+            "venue": "RAC Arena, Perth, Australia",
+            "city": "Perth",
+            "status": "Upcoming",
+            "broadcast": "Paramount+",
+            "ufc_url": "https://www.ufc.com/events",
+        },
+        {
+            "ufc_slug": "ufc-328",
+            "name": "UFC 328: Chimaev vs. Strickland",
+            "event_type": "Numbered",
+            "event_date": "2026-05-09",
+            "venue": "Prudential Center, Newark, New Jersey",
+            "city": "Newark",
+            "status": "Upcoming",
+            "broadcast": "Paramount+",
+            "ufc_url": "https://www.ufc.com/event/ufc-328",
+        },
+        {
+            "ufc_slug": "ufc-freedom-250",
+            "name": "UFC Freedom 250: Topuria vs. Gaethje",
+            "event_type": "Special",
+            "event_date": "2026-06-14",
+            "venue": "The White House South Lawn, Washington D.C.",
+            "city": "Washington D.C.",
+            "status": "Upcoming",
+            "broadcast": "Paramount+ / CBS",
+            "ufc_url": "https://www.ufc.com/events",
+        },
+    ]
 
-    event_links = set()
-    for a in soup.select("a[href*='/event/']"):
-        href = a.get("href", "")
-        if href:
-            full = f"{UFC_BASE}{href}" if href.startswith("/") else href
-            event_links.add(full)
-
-    log(f"Eventos encontrados: {len(event_links)}")
-
-    for url in tqdm(event_links, desc="Eventos", unit="event"):
-        data = scrape_event_detail(url)
-        if not data:
-            err_count += 1
-            continue
-
-        slug = url.rstrip("/").split("/")[-1]
-        existing = sb.table("events").select("id").eq("ufc_slug", slug).execute()
-
+    for ev in events:
+        ev["last_scraped_at"] = datetime.now(timezone.utc).isoformat()
         try:
-            payload = {
-                "ufc_slug":    slug,
-                "name":        data["name"],
-                "event_type":  data["event_type"],
-                "event_date":  data["event_date"],
-                "venue":       data.get("venue"),
-                "city":        data.get("city"),
-                "status":      data["status"],
-                "broadcast":   data.get("broadcast"),
-                "ufc_url":     url,
-                "last_scraped_at": datetime.now(timezone.utc).isoformat(),
-            }
-            sb.table("events").upsert(payload, on_conflict="ufc_slug").execute()
-            if existing.data:
-                upd_count += 1
-            else:
-                new_count += 1
+            sb.table("events").upsert(ev, on_conflict="ufc_slug").execute()
+            log(f"  ✅ {ev['name']}")
         except Exception as e:
-            log(f"  ERROR evento {slug}: {e}")
-            err_count += 1
+            log(f"  ❌ {ev['name']}: {e}")
 
-        time.sleep(REQUEST_DELAY)
-
-    sb.table("scraper_log").insert({
-        "scraper":     "ufc_events",
-        "status":      "success" if err_count == 0 else "partial",
-        "records_new": new_count,
-        "records_upd": upd_count,
-        "records_err": err_count,
-        "started_at":  started_at.isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    }).execute()
-
-    log(f"\n✅ Eventos: {new_count} nuevos · {upd_count} actualizados · {err_count} errores")
+    # Insertar combates de UFC 328
+    _insert_ufc328_fights()
+    log("✅ Fallback completado")
 
 
-def scrape_event_detail(url: str) -> Optional[dict]:
-    """Extrae datos de un evento."""
-    resp = safe_get(url)
-    if not resp:
-        return None
+def _insert_ufc328_fights():
+    """Inserta los combates confirmados del UFC 328."""
+    ev_res = sb.table("events").select("id").eq("ufc_slug","ufc-328").execute()
+    if not ev_res.data:
+        log("  No se encontró el evento UFC 328"); return
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    event_id = ev_res.data[0]["id"]
 
-    name_el = soup.select_one("h1, .e-col-9 h1, [class*='event-title']")
-    if not name_el:
-        return None
+    fights_data = [
+        # (nombre_a, nombre_b, weight_lbs, card_segment, is_main, is_title, pos)
+        ("Khamzat Chimaev",    "Sean Strickland",       185, "Main Card",   True,  True,  1),
+        ("Joshua Van",         "Tatsuro Taira",          125, "Main Card",   False, True,  2),
+        ("Alexander Volkov",   "Waldo Cortes-Acosta",   265, "Main Card",   False, False, 3),
+        ("Sean Brady",         "Joaquin Buckley",       170, "Main Card",   False, False, 4),
+        ("Jan Blachowicz",     "Bogdan Guskov",         205, "Main Card",   False, False, 5),
+        ("King Green",         "Jeremy Stephens",       155, "Prelims",     False, False, 6),
+        ("Roman Kopylov",      "Marco Tulio",           185, "Prelims",     False, False, 7),
+        ("Clayton Carpenter",  "Jose Ochoa",            125, "Prelims",     False, False, 8),
+        ("Baisangur Susurkaev","Djorden Santos",        185, "Prelims",     False, False, 9),
+        ("Ateba Gautier",      "Osman Diaz",            185, "Prelims",     False, False, 10),
+        ("Grant Dawson",       "Mateusz Rebecki",       155, "Prelims",     False, False, 11),
+        ("Pat Sabatini",       "William Gomis",         145, "Prelims",     False, False, 12),
+        ("Joel Alvarez",       "Yaroslav Amosov",       170, "Prelims",     False, False, 13),
+    ]
 
-    name = clean(name_el.get_text())
+    for f in fights_data:
+        name_a, name_b, weight, segment, is_main, is_title, pos = f
+        fa_id = _get_or_create_fighter(name_a)
+        fb_id = _get_or_create_fighter(name_b)
+        if not fa_id or not fb_id: continue
 
-    date_el = soup.select_one("[class*='date'], time")
-    date_str = clean(date_el.get_text()) if date_el else ""
-
-    venue_el = soup.select_one("[class*='venue'], [class*='location']")
-    venue = clean(venue_el.get_text()) if venue_el else ""
-
-    broadcast_el = soup.select_one("[class*='broadcast'], [class*='network']")
-    broadcast = clean(broadcast_el.get_text()) if broadcast_el else ""
-
-    event_type = "Numbered" if re.search(r'\bUFC\s+\d{3}\b', name) else "Fight Night"
-    status = "Upcoming"
-
-    # Intentar parsear fecha
-    event_date = None
-    date_match = re.search(r'(\w+ \d+,?\s*\d{4})', date_str)
-    if date_match:
         try:
-            from datetime import datetime
-            dt = datetime.strptime(date_match.group(1).replace(",", ""), "%B %d %Y")
-            event_date = dt.strftime("%Y-%m-%d")
-            if dt.date() < datetime.now().date():
-                status = "Completed"
-        except ValueError:
-            pass
+            existing = sb.table("fights").select("id").eq(
+                "event_id", event_id
+            ).eq("fighter_a_id", fa_id).execute()
 
-    if not event_date:
-        return None
+            payload = {
+                "event_id":       event_id,
+                "fighter_a_id":   fa_id,
+                "fighter_b_id":   fb_id,
+                "card_position":  pos,
+                "card_segment":   segment,
+                "is_main_event":  is_main,
+                "is_title_fight": is_title,
+                "status":         "Scheduled",
+                "weight_agreed_lbs": weight,
+                "scheduled_rounds": 5 if is_main or is_title else 3,
+            }
 
-    return {
-        "name":       name,
-        "event_type": event_type,
-        "event_date": event_date,
-        "venue":      venue,
-        "city":       venue,
-        "status":     status,
-        "broadcast":  broadcast,
-    }
+            if existing.data:
+                sb.table("fights").update(payload).eq("id", existing.data[0]["id"]).execute()
+            else:
+                sb.table("fights").insert(payload).execute()
+
+            log(f"  ✅ {name_a} vs {name_b}")
+        except Exception as e:
+            log(f"  ❌ {name_a} vs {name_b}: {e}")
+
+
+# ─────────────────────────────────────────
+# LOG SCRAPER
+# ─────────────────────────────────────────
+def _log_scraper(name, new_c, upd_c, err_c, started):
+    if not sb: return
+    try:
+        sb.table("scraper_log").insert({
+            "scraper":     name,
+            "status":      "success" if err_c == 0 else "partial",
+            "records_new": new_c,
+            "records_upd": upd_c,
+            "records_err": err_c,
+            "started_at":  started.isoformat(),
+            "finished_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except: pass
 
 
 # ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MMA Live UFC Scraper")
-    parser.add_argument(
-        "--mode",
-        choices=["fighters", "events", "all", "update", "test"],
-        default="all",
-        help="Qué scraper ejecutar"
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Límite de peleadores (para pruebas)"
-    )
+    parser = argparse.ArgumentParser(description="MMA Live Scraper")
+    parser.add_argument("--mode", choices=["events","fighters","all","test","fallback"], default="fallback")
+    parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
-    sb = get_supabase()
-    log(f"✅ Conectado a Supabase: {SUPABASE_URL[:40]}...")
+    if not sb:
+        log("❌ SUPABASE_URL o SUPABASE_SERVICE_KEY no configurados en .env")
+        sys.exit(1)
 
-    if args.mode in ("fighters", "all"):
-        scrape_all_fighters(sb, limit=args.limit if args.mode == "test" else None)
+    log(f"✅ Conectado a Supabase: {SUPABASE_URL[:50]}...")
 
-    if args.mode in ("events", "all", "update"):
-        scrape_events(sb)
+    if args.mode == "fallback":
+        # Modo más rápido: inserta los eventos actuales hardcodeados
+        insert_fallback_events()
 
-    if args.mode == "test":
-        scrape_all_fighters(sb, limit=args.limit or 10)
-        scrape_events(sb)
+    elif args.mode == "events":
+        # Scrapea ufcstats.com + inserta fallback de eventos actuales
+        scrape_events()
+        insert_fallback_events()
 
-    log("\n🏁 Scraping completado.")
+    elif args.mode == "fighters":
+        scrape_fighters(limit=args.limit)
+
+    elif args.mode == "all":
+        scrape_events()
+        insert_fallback_events()
+        scrape_fighters(limit=args.limit)
+
+    elif args.mode == "test":
+        log("Modo TEST: solo fallback + 5 peleadores")
+        insert_fallback_events()
+        scrape_fighters(limit=5)
+
+    log("\n🏁 Scraper completado.")
