@@ -2,17 +2,20 @@ fastapi==0.110.0
 uvicorn[standard]==0.29.0
 python-dotenv==1.0.1
 
-# 🔥 Bajamos a Pydantic v1 (sin Rust)
+# Pydantic sin Rust
 pydantic[email]==1.10.13
 
 requests==2.31.0
 beautifulsoup4==4.12.3
 lxml==5.2.1
 tqdm==4.66.4
-httpx==0.27.0
+
+# 🔧 FIX AQUÍ
+httpx==0.24.1
+
 python-jose[cryptography]==3.3.0
 
-# Supabase (ok como lo tienes)
+# Supabase
 supabase==1.2.0
 gotrue==1.3.0
 postgrest==0.13.2
